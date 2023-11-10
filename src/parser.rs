@@ -1,4 +1,4 @@
-use std::{ffi::CStr, net::IpAddr};
+use std::{ffi::CStr, mem::size_of, net::IpAddr};
 
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -6,13 +6,17 @@ use std::collections::BTreeSet;
 
 use crate::events::{Event, Events};
 
-const NBITSMINOR32: u32 = 18;
-const NBITSMINOR64: u64 = 32;
-const MAXMAJ64: u64 = u32::MAX as u64;
-const MAXMIN64: u64 = u32::MAX as u64;
-const MAXMAJ32: u32 = 0x3FFF;
-const MAXMIN32: u32 = 0x3FFFF;
+#[allow(unused)]
+pub mod devnums {
+    pub const NBITSMINOR32: u32 = 18;
+    pub const NBITSMINOR64: u64 = 32;
+    pub const MAXMAJ64: u64 = u32::MAX as u64;
+    pub const MAXMIN64: u64 = u32::MAX as u64;
+    pub const MAXMAJ32: u32 = 0x3FFF;
+    pub const MAXMIN32: u32 = 0x3FFFF;
+}
 
+#[allow(unused)]
 pub mod tok {
     pub mod ctl {
         pub const INVALID: u8 = 0x0;
@@ -37,7 +41,9 @@ pub mod tok {
         pub const AUT_EXEC_ARGS: u8 = 0x3c;
         pub const AUT_ZONENAME: u8 = 0x60;
         pub const AUT_UAUTH: u8 = 0x3f;
+        pub const AUT_UPRIV: u8 = 0x39;
         pub const AUT_FMRI: u8 = 0x20;
+        pub const AUT_ARG32: u8 = 0x2D;
     }
     pub mod iptype {
         pub const IPV4: u32 = 4;
@@ -53,25 +59,8 @@ pub mod tok {
     }
 }
 
-pub struct Parser {
-    buf: BytesMut,
-    state: State,
-    events: Events,
-}
-
-enum State {
-    Pre,
-
-    PreFile,
-    FileNameString { token: u8, sec: u32, usec: u32, namelen: usize },
-
-    PreHeader,
-    Header64Ex { rem: usize },
-    Header32Ex { rem: usize },
-}
-
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Modifiers {
+pub enum Modifiers {
     Read,
     Write,
     PrivilegeUsed,
@@ -147,60 +136,40 @@ pub enum Record {
     },
 }
 
-#[derive(Debug)]
-pub enum DataToken {
-    Text {
-        text: String,
-    },
-    Subject {
-        audit_uid: u32,
-        uid: u32,
-        gid: u32,
-        ruid: u32,
-        rgid: u32,
-        pid: u32,
-        sid: u32,
-        major: u32,
-        minor: u32,
-        machine: std::net::Ipv4Addr,
-    },
-    Return32 {
-        number: i8,
-        value: i32,
-    },
-    Return64 {
-        number: i8,
-        value: i64,
-    },
-    Path {
-        path: String,
-    },
-    Attribute {
-        mode: u32,
-        uid: u32,
-        gid: u32,
-        fsid: u32,
-        node_id: u64,
-        device_id: u64,
-    },
-    ExecArgs {
-        args: Vec<String>,
-    },
-    ZoneName {
-        zonename: String,
-    },
-    UseOfAuth {
-        /**
-         * The name of an rbac(7) authorisation; e.g., "solaris.smf.modify".
-         */
-        auth: String,
-    },
-    Fmri {
-        /**
-         * An SMF FMRI that identifies the target of the action.
-         */
-        fmri: String,
-    },
+impl Record {
+    pub fn data(&self) -> Result<Vec<DataToken>> {
+        match self {
+            Record::FileToken { .. } => Ok(Default::default()),
+            Record::Header64Ex { bytes, .. }
+            | Record::Header32Ex { bytes, .. } => {
+                let mut p = DataParser::new(bytes.clone());
+                let mut out = Vec::new();
+
+                while let Some(dt) = p.pull()? {
+                    out.push(dt);
+                }
+
+                Ok(out)
+            }
+        }
+    }
+}
+
+pub struct Parser {
+    buf: BytesMut,
+    state: State,
+    events: Events,
+}
+
+enum State {
+    Pre,
+
+    PreFile,
+    FileNameString { sec: u32, usec: u32, namelen: usize },
+
+    PreHeader,
+    Header64Ex { rem: usize },
+    Header32Ex { rem: usize },
 }
 
 impl Parser {
@@ -253,7 +222,7 @@ impl Parser {
 
                 self.buf.clear();
                 self.state =
-                    State::FileNameString { token, sec, usec, namelen };
+                    State::FileNameString { sec, usec, namelen };
 
                 Ok(None)
             }
@@ -281,7 +250,7 @@ impl Parser {
                 };
                 return Ok(None);
             }
-            State::FileNameString { sec, usec, namelen, .. } => {
+            State::FileNameString { sec, usec, namelen } => {
                 if self.buf.len() < namelen {
                     return Ok(None);
                 }
@@ -412,363 +381,292 @@ impl Parser {
     }
 }
 
-impl Record {
-    pub fn data(&self) -> Result<Vec<DataToken>> {
-        match self {
-            Record::FileToken { .. } => Ok(Default::default()),
-            Record::Header64Ex { bytes, .. }
-            | Record::Header32Ex { bytes, .. } => {
-                let mut p = DataParser::new();
-
-                Ok(bytes
-                    .iter()
-                    .map(|b| Ok(p.push(*b)?))
-                    .collect::<Result<Vec<_>>>()?
-                    .into_iter()
-                    .filter_map(|ev| ev)
-                    .collect())
-            }
-        }
-    }
-}
-
-enum DataState {
-    Pre,
-    Text,
-    TextString { len: usize },
-    Subject { wide: bool },
-    Return32,
-    Return64,
-    Path,
-    PathString { len: usize },
-    Attribute64,
-    ExecArgs,
-    ExecArgsString { count: usize },
-    ZoneName,
-    ZoneNameString { len: usize },
-    UseOfAuth,
-    UseOfAuthString { len: usize },
-    Fmri,
-    FmriString { len: usize },
+#[derive(Debug)]
+pub enum DataToken {
+    Text(String),
+    Subject {
+        audit_uid: u32,
+        uid: u32,
+        gid: u32,
+        ruid: u32,
+        rgid: u32,
+        pid: u32,
+        sid: u32,
+        major: u32,
+        minor: u32,
+        machine: std::net::Ipv4Addr,
+    },
+    Return32 {
+        number: i8,
+        value: i32,
+    },
+    Return64 {
+        number: i8,
+        value: i64,
+    },
+    Path(String),
+    Attribute {
+        mode: u32,
+        uid: u32,
+        gid: u32,
+        fsid: u32,
+        node_id: u64,
+        device_id: u64,
+    },
+    ExecArgs(Vec<String>),
+    ZoneName(String),
+    /**
+     * The name of an rbac(7) authorisation; e.g., "solaris.smf.modify".
+     */
+    UseOfAuth(String),
+    UseOfPriv {
+        success: bool,
+        privs: String,
+    },
+    /**
+     * An SMF FMRI that identifies the target of the action.
+     */
+    Fmri(String),
+    Arg {
+        num: u8,
+        value: u32,
+        desc: String,
+    },
 }
 
 struct DataParser {
-    buf: BytesMut,
-    args: Vec<String>,
-    state: DataState,
+    fin: bool,
+    error: Option<String>,
+    input: Bytes,
 }
 
 impl DataParser {
-    pub fn new() -> DataParser {
-        DataParser {
-            buf: Default::default(),
-            args: Default::default(),
-            state: DataState::Pre,
+    pub fn new(input: Bytes) -> DataParser {
+        DataParser { fin: false, error: None, input }
+    }
+
+    pub fn pull(&mut self) -> Result<Option<DataToken>> {
+        if let Some(e) = &self.error {
+            bail!("{e}");
+        }
+
+        if self.fin {
+            return Ok(None);
+        }
+
+        if !self.input.has_remaining() {
+            self.fin = true;
+            return Ok(None);
+        }
+
+        let res = match self.input.get_u8() {
+            tok::data::AUT_TEXT => self.pull_text(),
+            tok::data::AUT_SUBJECT32 => self.pull_subject(false),
+            tok::data::AUT_SUBJECT64 => self.pull_subject(true),
+            tok::data::AUT_RETURN32 => self.pull_return32(),
+            tok::data::AUT_RETURN64 => self.pull_return64(),
+            tok::data::AUT_PATH => self.pull_path(),
+            tok::data::AUT_ATTR64 => self.pull_attr64(),
+            tok::data::AUT_EXEC_ARGS => self.pull_exec_args(),
+            tok::data::AUT_ZONENAME => self.pull_zonename(),
+            tok::data::AUT_UAUTH => self.pull_uauth(),
+            tok::data::AUT_UPRIV => self.pull_upriv(),
+            tok::data::AUT_FMRI => self.pull_fmri(),
+            tok::data::AUT_ARG32 => self.pull_arg(),
+            other => bail!("unknown data token type 0x{other:x}"),
+        };
+
+        match res {
+            Ok(res) => Ok(Some(res)),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                Err(e)
+            }
         }
     }
 
-    fn get_cstr(&mut self) -> Result<String> {
-        match CStr::from_bytes_with_nul(&self.buf) {
+    fn pull_string(&mut self) -> Result<String> {
+        let mut arg: Vec<u8> = Vec::new();
+
+        while self.input.has_remaining() {
+            let b = self.input.get_u8();
+            if b == b'\0' {
+                break;
+            }
+            arg.push(b);
+        }
+
+        Ok(String::from_utf8(arg)?)
+    }
+
+    fn pull_adr_string(&mut self) -> Result<String> {
+        if self.input.remaining() < size_of::<u16>() {
+            bail!("partial string");
+        }
+
+        let len: usize = self.input.get_u16().try_into().unwrap();
+        if self.input.remaining() < len {
+            bail!("partial string");
+        }
+
+        match CStr::from_bytes_with_nul(&self.input[0..len]) {
             Ok(cstr) => match cstr.to_str() {
                 Ok(s) => {
                     let s = s.to_string();
-                    self.buf.advance(self.buf.len());
+                    self.input.advance(len);
                     Ok(s)
                 }
-                Err(e) => bail!("invalid text string: {e}"),
+                Err(e) => bail!("invalid string: {e}"),
             },
-            Err(e) => bail!("invalid text string: {e}"),
+            Err(e) => bail!("invalid string: {e}"),
         }
     }
 
-    pub fn push(&mut self, b: u8) -> Result<Option<DataToken>> {
-        self.buf.put_u8(b);
+    fn pull_text(&mut self) -> Result<DataToken> {
+        Ok(DataToken::Text(self.pull_adr_string()?))
+    }
 
-        match self.state {
-            DataState::Pre => {
-                assert_eq!(self.buf.len(), 1);
+    fn pull_path(&mut self) -> Result<DataToken> {
+        Ok(DataToken::Path(self.pull_adr_string()?))
+    }
 
-                self.state = match self.buf[0] {
-                    tok::data::AUT_TEXT => DataState::Text,
-                    tok::data::AUT_SUBJECT32 => {
-                        DataState::Subject { wide: false }
-                    }
-                    tok::data::AUT_SUBJECT64 => {
-                        DataState::Subject { wide: true }
-                    }
-                    tok::data::AUT_RETURN32 => DataState::Return32,
-                    tok::data::AUT_RETURN64 => DataState::Return64,
-                    tok::data::AUT_PATH => DataState::Path,
-                    tok::data::AUT_ATTR64 => DataState::Attribute64,
-                    tok::data::AUT_EXEC_ARGS => DataState::ExecArgs,
-                    tok::data::AUT_ZONENAME => DataState::ZoneName,
-                    tok::data::AUT_UAUTH => DataState::UseOfAuth,
-                    tok::data::AUT_FMRI => DataState::Fmri,
-                    other => bail!("unknown data token type 0x{other:x}"),
-                };
-                Ok(None)
-            }
-            DataState::Text => {
-                if self.buf.len() < 1 + 2 {
-                    return Ok(None);
-                }
+    fn pull_zonename(&mut self) -> Result<DataToken> {
+        Ok(DataToken::ZoneName(self.pull_adr_string()?))
+    }
 
-                let _token = self.buf.get_u8();
-                let len = self.buf.get_u16().try_into().unwrap();
+    fn pull_uauth(&mut self) -> Result<DataToken> {
+        Ok(DataToken::UseOfAuth(self.pull_adr_string()?))
+    }
 
-                self.state = DataState::TextString { len };
-                Ok(None)
-            }
-            DataState::TextString { len } => {
-                if self.buf.len() < len {
-                    return Ok(None);
-                }
+    fn pull_fmri(&mut self) -> Result<DataToken> {
+        Ok(DataToken::Fmri(self.pull_adr_string()?))
+    }
 
-                let text = self.get_cstr()?;
-
-                self.state = DataState::Pre;
-                Ok(Some(DataToken::Text { text }))
-            }
-            DataState::Subject { wide } => {
-                let tidsz = if wide { 8 } else { 4 };
-                if self.buf.len() < 1 + 7 * 4 + tidsz + 4 {
-                    return Ok(None);
-                }
-
-                if wide {
-                    assert_eq!(self.buf.get_u8(), tok::data::AUT_SUBJECT64);
-                } else {
-                    assert_eq!(self.buf.get_u8(), tok::data::AUT_SUBJECT32);
-                }
-
-                let audit_uid = self.buf.get_u32();
-                let uid = self.buf.get_u32();
-                let gid = self.buf.get_u32();
-                let ruid = self.buf.get_u32();
-                let rgid = self.buf.get_u32();
-                let pid = self.buf.get_u32();
-                let sid = self.buf.get_u32();
-                let (major, minor) = if wide {
-                    let tid = self.buf.get_u64();
-                    (
-                        (tid >> NBITSMINOR64).try_into().unwrap(),
-                        (tid & MAXMIN64).try_into().unwrap(),
-                    )
-                } else {
-                    let tid = self.buf.get_u32();
-                    (
-                        (tid >> NBITSMINOR32).try_into().unwrap(),
-                        (tid & MAXMIN32).try_into().unwrap(),
-                    )
-                };
-                let machine = std::net::Ipv4Addr::new(
-                    self.buf.get_u8(),
-                    self.buf.get_u8(),
-                    self.buf.get_u8(),
-                    self.buf.get_u8(),
-                );
-
-                assert!(self.buf.is_empty());
-                self.state = DataState::Pre;
-                Ok(Some(DataToken::Subject {
-                    audit_uid,
-                    uid,
-                    gid,
-                    ruid,
-                    rgid,
-                    pid,
-                    sid,
-                    major,
-                    minor,
-                    machine,
-                }))
-            }
-            DataState::Return32 => {
-                if self.buf.len() < 1 + 1 + 4 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_RETURN32);
-
-                let number = self.buf.get_i8();
-                let value = self.buf.get_i32();
-
-                assert!(self.buf.is_empty());
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::Return32 { number, value }))
-            }
-            DataState::Return64 => {
-                if self.buf.len() < 1 + 1 + 8 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_RETURN64);
-
-                let number = self.buf.get_i8();
-                let value = self.buf.get_i64();
-
-                assert!(self.buf.is_empty());
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::Return64 { number, value }))
-            }
-            DataState::Path => {
-                if self.buf.len() < 1 + 2 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_PATH);
-
-                let len = self.buf.get_u16().try_into().unwrap();
-
-                self.state = DataState::PathString { len };
-                Ok(None)
-            }
-            DataState::PathString { len } => {
-                if self.buf.len() < len {
-                    return Ok(None);
-                }
-
-                let path = self.get_cstr()?;
-
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::Path { path }))
-            }
-            DataState::Attribute64 => {
-                if self.buf.len() < 1 + 4 * 4 + 2 * 8 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_ATTR64);
-
-                let mode = self.buf.get_u32();
-                let uid = self.buf.get_u32();
-                let gid = self.buf.get_u32();
-                let fsid = self.buf.get_u32();
-                let node_id = self.buf.get_u64();
-                let device_id = self.buf.get_u64();
-
-                assert!(self.buf.is_empty());
-                self.state = DataState::Pre;
-                Ok(Some(DataToken::Attribute {
-                    mode,
-                    uid,
-                    gid,
-                    fsid,
-                    node_id,
-                    device_id,
-                }))
-            }
-            DataState::ExecArgs => {
-                if self.buf.len() < 1 + 4 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_EXEC_ARGS);
-
-                let count = self.buf.get_u32().try_into().unwrap();
-
-                self.args.clear();
-                assert!(self.buf.is_empty());
-
-                if count == 0 {
-                    self.state = DataState::Pre;
-                    Ok(Some(DataToken::ExecArgs { args: Default::default() }))
-                } else {
-                    self.state = DataState::ExecArgsString { count };
-                    Ok(None)
-                }
-            }
-            DataState::ExecArgsString { count } => {
-                if self.buf[self.buf.len() - 1] != b'\0' {
-                    return Ok(None);
-                }
-
-                let s = self.get_cstr()?;
-
-                self.args.push(s);
-                let count = count.checked_sub(1).unwrap();
-
-                if count == 0 {
-                    self.state = DataState::Pre;
-                    let args = std::mem::take(&mut self.args);
-                    Ok(Some(DataToken::ExecArgs { args }))
-                } else {
-                    self.state = DataState::ExecArgsString { count };
-                    Ok(None)
-                }
-            }
-            DataState::ZoneName => {
-                if self.buf.len() < 1 + 2 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_ZONENAME);
-
-                let len = self.buf.get_u16().try_into().unwrap();
-
-                self.state = DataState::ZoneNameString { len };
-                Ok(None)
-            }
-            DataState::ZoneNameString { len } => {
-                if self.buf.len() < len {
-                    return Ok(None);
-                }
-
-                let zonename = self.get_cstr()?;
-
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::ZoneName { zonename }))
-            }
-            DataState::UseOfAuth => {
-                if self.buf.len() < 1 + 2 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_UAUTH);
-
-                let len = self.buf.get_u16().try_into().unwrap();
-
-                self.state = DataState::UseOfAuthString { len };
-                Ok(None)
-            }
-            DataState::UseOfAuthString { len } => {
-                if self.buf.len() < len {
-                    return Ok(None);
-                }
-
-                let auth = self.get_cstr()?;
-
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::UseOfAuth { auth }))
-            }
-            DataState::Fmri => {
-                if self.buf.len() < 1 + 2 {
-                    return Ok(None);
-                }
-
-                assert_eq!(self.buf.get_u8(), tok::data::AUT_FMRI);
-
-                let len = self.buf.get_u16().try_into().unwrap();
-
-                self.state = DataState::FmriString { len };
-                Ok(None)
-            }
-            DataState::FmriString { len } => {
-                if self.buf.len() < len {
-                    return Ok(None);
-                }
-
-                let fmri = self.get_cstr()?;
-
-                self.state = DataState::Pre;
-                self.buf.clear();
-                Ok(Some(DataToken::Fmri { fmri }))
-            }
+    fn pull_arg(&mut self) -> Result<DataToken> {
+        if self.input.remaining() < size_of::<u8>() + size_of::<u32>() {
+            bail!("partial arg32");
         }
+
+        let num = self.input.get_u8();
+        let value = self.input.get_u32();
+        let desc = self.pull_adr_string()?;
+
+        Ok(DataToken::Arg { num, value, desc })
+    }
+
+    fn pull_exec_args(&mut self) -> Result<DataToken> {
+        if self.input.remaining() < size_of::<u32>() {
+            bail!("partial exec args");
+        }
+
+        let count = self.input.get_u32().try_into().unwrap();
+        let mut args = Vec::new();
+
+        while args.len() < count {
+            args.push(self.pull_string()?);
+        }
+
+        if args.len() != count {
+            bail!("partial exec args");
+        }
+
+        Ok(DataToken::ExecArgs(args))
+    }
+
+    fn pull_subject(&mut self, wide: bool) -> Result<DataToken> {
+        let tidsz = if wide { size_of::<u64>() } else { size_of::<u32>() };
+        if self.input.remaining()
+            < 7 * size_of::<u32>() + tidsz + size_of::<u32>()
+        {
+            bail!("partial subject");
+        }
+
+        let audit_uid = self.input.get_u32();
+        let uid = self.input.get_u32();
+        let gid = self.input.get_u32();
+        let ruid = self.input.get_u32();
+        let rgid = self.input.get_u32();
+        let pid = self.input.get_u32();
+        let sid = self.input.get_u32();
+        let (major, minor) = if wide {
+            let tid = self.input.get_u64();
+            (
+                (tid >> devnums::NBITSMINOR64).try_into().unwrap(),
+                (tid & devnums::MAXMIN64).try_into().unwrap(),
+            )
+        } else {
+            let tid = self.input.get_u32();
+            (
+                (tid >> devnums::NBITSMINOR32).try_into().unwrap(),
+                (tid & devnums::MAXMIN32).try_into().unwrap(),
+            )
+        };
+        let machine = std::net::Ipv4Addr::new(
+            self.input.get_u8(),
+            self.input.get_u8(),
+            self.input.get_u8(),
+            self.input.get_u8(),
+        );
+
+        Ok(DataToken::Subject {
+            audit_uid,
+            uid,
+            gid,
+            ruid,
+            rgid,
+            pid,
+            sid,
+            major,
+            minor,
+            machine,
+        })
+    }
+
+    fn pull_return32(&mut self) -> Result<DataToken> {
+        if self.input.remaining() < size_of::<u32>() {
+            bail!("partial return");
+        }
+
+        let number = self.input.get_i8();
+        let value = self.input.get_i32();
+
+        Ok(DataToken::Return32 { number, value })
+    }
+
+    fn pull_return64(&mut self) -> Result<DataToken> {
+        if self.input.remaining() < size_of::<u64>() {
+            bail!("partial return");
+        }
+
+        let number = self.input.get_i8();
+        let value = self.input.get_i64();
+
+        Ok(DataToken::Return64 { number, value })
+    }
+
+    fn pull_attr64(&mut self) -> Result<DataToken> {
+        if self.input.len() < 4 * size_of::<u32>() + 2 * size_of::<u64>() {
+            bail!("partial attribute");
+        }
+
+        let mode = self.input.get_u32();
+        let uid = self.input.get_u32();
+        let gid = self.input.get_u32();
+        let fsid = self.input.get_u32();
+        let node_id = self.input.get_u64();
+        let device_id = self.input.get_u64();
+
+        Ok(DataToken::Attribute { mode, uid, gid, fsid, node_id, device_id })
+    }
+
+    fn pull_upriv(&mut self) -> Result<DataToken> {
+        if !self.input.has_remaining() {
+            bail!("partial upriv");
+        }
+
+        let success = self.input.get_u8() != 0;
+        let privs = self.pull_adr_string()?;
+
+        Ok(DataToken::UseOfPriv { success, privs })
     }
 }

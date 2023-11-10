@@ -5,6 +5,7 @@ use anyhow::{bail, Result};
 mod events;
 mod parser;
 
+#[allow(unused)]
 #[derive(Debug)]
 struct AuditLog {
     start: String,
@@ -65,7 +66,7 @@ fn main() -> Result<()> {
 
     for e in ents {
         let mut p = parser::Parser::new(&events);
-        let mut f = std::fs::File::open(&e.path)?;
+        let f = std::fs::File::open(&e.path)?;
         let mut br = std::io::BufReader::new(f);
 
         println!("AUDIT LOG = {e:?}");
