@@ -1,4 +1,4 @@
-use std::{io::Read, path::PathBuf};
+use std::{io::Read, path::PathBuf, time::Duration};
 
 use anyhow::{bail, Result};
 
@@ -15,12 +15,15 @@ struct AuditLog {
 
 fn main() -> Result<()> {
     let a = getopts::Options::new()
+        .optflag("f", "", "follow the unterminated file")
         .parsing_style(getopts::ParsingStyle::StopAtFirstFree)
         .parse(std::env::args().skip(1))?;
 
     if a.free.len() != 1 {
         bail!("specify audit file directory");
     }
+
+    let follow = a.opt_present("f");
 
     let events = events::Events::new()?;
 
@@ -71,6 +74,10 @@ fn main() -> Result<()> {
             let mut buf = vec![0u8];
             match br.read(&mut buf) {
                 Ok(0) => {
+                    if follow && e.end.is_none() {
+                        std::thread::sleep(Duration::from_millis(250));
+                        continue;
+                    }
                     println!("EOF");
                     break;
                 }

@@ -35,6 +35,9 @@ pub mod tok {
         pub const AUT_PATH: u8 = 0x23;
         pub const AUT_ATTR64: u8 = 0x73;
         pub const AUT_EXEC_ARGS: u8 = 0x3c;
+        pub const AUT_ZONENAME: u8 = 0x60;
+        pub const AUT_UAUTH: u8 = 0x3f;
+        pub const AUT_FMRI: u8 = 0x20;
     }
     pub mod iptype {
         pub const IPV4: u32 = 4;
@@ -142,6 +145,10 @@ pub enum Record {
         nsec: u32,
         bytes: Bytes,
     },
+}
+
+#[derive(Debug)]
+pub enum DataToken {
     Text {
         text: String,
     },
@@ -178,6 +185,21 @@ pub enum Record {
     },
     ExecArgs {
         args: Vec<String>,
+    },
+    ZoneName {
+        zonename: String,
+    },
+    UseOfAuth {
+        /**
+         * The name of an rbac(7) authorisation; e.g., "solaris.smf.modify".
+         */
+        auth: String,
+    },
+    Fmri {
+        /**
+         * An SMF FMRI that identifies the target of the action.
+         */
+        fmri: String,
     },
 }
 
@@ -391,16 +413,9 @@ impl Parser {
 }
 
 impl Record {
-    pub fn data(&self) -> Result<Vec<Record>> {
+    pub fn data(&self) -> Result<Vec<DataToken>> {
         match self {
-            Record::FileToken { .. }
-            | Record::Text { .. }
-            | Record::Return32 { .. }
-            | Record::Return64 { .. }
-            | Record::Path { .. }
-            | Record::Attribute { .. }
-            | Record::ExecArgs { .. }
-            | Record::Subject { .. } => Ok(Default::default()),
+            Record::FileToken { .. } => Ok(Default::default()),
             Record::Header64Ex { bytes, .. }
             | Record::Header32Ex { bytes, .. } => {
                 let mut p = DataParser::new();
@@ -429,6 +444,12 @@ enum DataState {
     Attribute64,
     ExecArgs,
     ExecArgsString { count: usize },
+    ZoneName,
+    ZoneNameString { len: usize },
+    UseOfAuth,
+    UseOfAuthString { len: usize },
+    Fmri,
+    FmriString { len: usize },
 }
 
 struct DataParser {
@@ -460,7 +481,7 @@ impl DataParser {
         }
     }
 
-    pub fn push(&mut self, b: u8) -> Result<Option<Record>> {
+    pub fn push(&mut self, b: u8) -> Result<Option<DataToken>> {
         self.buf.put_u8(b);
 
         match self.state {
@@ -480,6 +501,9 @@ impl DataParser {
                     tok::data::AUT_PATH => DataState::Path,
                     tok::data::AUT_ATTR64 => DataState::Attribute64,
                     tok::data::AUT_EXEC_ARGS => DataState::ExecArgs,
+                    tok::data::AUT_ZONENAME => DataState::ZoneName,
+                    tok::data::AUT_UAUTH => DataState::UseOfAuth,
+                    tok::data::AUT_FMRI => DataState::Fmri,
                     other => bail!("unknown data token type 0x{other:x}"),
                 };
                 Ok(None)
@@ -503,7 +527,7 @@ impl DataParser {
                 let text = self.get_cstr()?;
 
                 self.state = DataState::Pre;
-                Ok(Some(Record::Text { text }))
+                Ok(Some(DataToken::Text { text }))
             }
             DataState::Subject { wide } => {
                 let tidsz = if wide { 8 } else { 4 };
@@ -546,7 +570,7 @@ impl DataParser {
 
                 assert!(self.buf.is_empty());
                 self.state = DataState::Pre;
-                Ok(Some(Record::Subject {
+                Ok(Some(DataToken::Subject {
                     audit_uid,
                     uid,
                     gid,
@@ -572,7 +596,7 @@ impl DataParser {
                 assert!(self.buf.is_empty());
                 self.state = DataState::Pre;
                 self.buf.clear();
-                Ok(Some(Record::Return32 { number, value }))
+                Ok(Some(DataToken::Return32 { number, value }))
             }
             DataState::Return64 => {
                 if self.buf.len() < 1 + 1 + 8 {
@@ -587,7 +611,7 @@ impl DataParser {
                 assert!(self.buf.is_empty());
                 self.state = DataState::Pre;
                 self.buf.clear();
-                Ok(Some(Record::Return64 { number, value }))
+                Ok(Some(DataToken::Return64 { number, value }))
             }
             DataState::Path => {
                 if self.buf.len() < 1 + 2 {
@@ -610,7 +634,7 @@ impl DataParser {
 
                 self.state = DataState::Pre;
                 self.buf.clear();
-                Ok(Some(Record::Path { path }))
+                Ok(Some(DataToken::Path { path }))
             }
             DataState::Attribute64 => {
                 if self.buf.len() < 1 + 4 * 4 + 2 * 8 {
@@ -628,7 +652,7 @@ impl DataParser {
 
                 assert!(self.buf.is_empty());
                 self.state = DataState::Pre;
-                Ok(Some(Record::Attribute {
+                Ok(Some(DataToken::Attribute {
                     mode,
                     uid,
                     gid,
@@ -651,7 +675,7 @@ impl DataParser {
 
                 if count == 0 {
                     self.state = DataState::Pre;
-                    Ok(Some(Record::ExecArgs { args: Default::default() }))
+                    Ok(Some(DataToken::ExecArgs { args: Default::default() }))
                 } else {
                     self.state = DataState::ExecArgsString { count };
                     Ok(None)
@@ -670,11 +694,80 @@ impl DataParser {
                 if count == 0 {
                     self.state = DataState::Pre;
                     let args = std::mem::take(&mut self.args);
-                    Ok(Some(Record::ExecArgs { args }))
+                    Ok(Some(DataToken::ExecArgs { args }))
                 } else {
                     self.state = DataState::ExecArgsString { count };
                     Ok(None)
                 }
+            }
+            DataState::ZoneName => {
+                if self.buf.len() < 1 + 2 {
+                    return Ok(None);
+                }
+
+                assert_eq!(self.buf.get_u8(), tok::data::AUT_ZONENAME);
+
+                let len = self.buf.get_u16().try_into().unwrap();
+
+                self.state = DataState::ZoneNameString { len };
+                Ok(None)
+            }
+            DataState::ZoneNameString { len } => {
+                if self.buf.len() < len {
+                    return Ok(None);
+                }
+
+                let zonename = self.get_cstr()?;
+
+                self.state = DataState::Pre;
+                self.buf.clear();
+                Ok(Some(DataToken::ZoneName { zonename }))
+            }
+            DataState::UseOfAuth => {
+                if self.buf.len() < 1 + 2 {
+                    return Ok(None);
+                }
+
+                assert_eq!(self.buf.get_u8(), tok::data::AUT_UAUTH);
+
+                let len = self.buf.get_u16().try_into().unwrap();
+
+                self.state = DataState::UseOfAuthString { len };
+                Ok(None)
+            }
+            DataState::UseOfAuthString { len } => {
+                if self.buf.len() < len {
+                    return Ok(None);
+                }
+
+                let auth = self.get_cstr()?;
+
+                self.state = DataState::Pre;
+                self.buf.clear();
+                Ok(Some(DataToken::UseOfAuth { auth }))
+            }
+            DataState::Fmri => {
+                if self.buf.len() < 1 + 2 {
+                    return Ok(None);
+                }
+
+                assert_eq!(self.buf.get_u8(), tok::data::AUT_FMRI);
+
+                let len = self.buf.get_u16().try_into().unwrap();
+
+                self.state = DataState::FmriString { len };
+                Ok(None)
+            }
+            DataState::FmriString { len } => {
+                if self.buf.len() < len {
+                    return Ok(None);
+                }
+
+                let fmri = self.get_cstr()?;
+
+                self.state = DataState::Pre;
+                self.buf.clear();
+                Ok(Some(DataToken::Fmri { fmri }))
             }
         }
     }
