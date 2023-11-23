@@ -17,6 +17,7 @@ struct AuditLog {
 fn main() -> Result<()> {
     let a = getopts::Options::new()
         .optflag("f", "", "follow the unterminated file")
+        .optflag("R", "", "only look at the most recent file")
         .parsing_style(getopts::ParsingStyle::StopAtFirstFree)
         .parse(std::env::args().skip(1))?;
 
@@ -25,6 +26,7 @@ fn main() -> Result<()> {
     }
 
     let follow = a.opt_present("f");
+    let only_recent = a.opt_present("R");
 
     let events = events::Events::new()?;
 
@@ -40,7 +42,8 @@ fn main() -> Result<()> {
                 bail!("unexpected item in bagging area: {ent:?}");
             }
 
-            let Some(name) = ent.file_name().to_str().map(str::to_string) else {
+            let Some(name) = ent.file_name().to_str().map(str::to_string)
+            else {
                 bail!("invalid file name: {ent:?}");
             };
 
@@ -68,6 +71,10 @@ fn main() -> Result<()> {
         let mut p = parser::Parser::new(&events);
         let f = std::fs::File::open(&e.path)?;
         let mut br = std::io::BufReader::new(f);
+
+        if only_recent && e.end.is_some() {
+            continue;
+        }
 
         println!("AUDIT LOG = {e:?}");
 

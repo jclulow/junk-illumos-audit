@@ -221,8 +221,7 @@ impl Parser {
                 let namelen = self.buf.get_u16().try_into().unwrap();
 
                 self.buf.clear();
-                self.state =
-                    State::FileNameString { sec, usec, namelen };
+                self.state = State::FileNameString { sec, usec, namelen };
 
                 Ok(None)
             }
